@@ -14,10 +14,34 @@ const {
   listOffcuts,
   allocateOffcuts,
   releaseAllocations,
+  initPersistence,
+  SnapshotError,
 } = require('./src/offcuts');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+
+// 余料库存快照：每次录入 / 登记 / 预占 / 释放先原子写盘再发布；
+// 启动时恢复余料、预占关系与三个自动编号，快照损坏则拒绝启动。
+// 默认 /app/data/offcuts-snapshot.json（Docker 数据卷挂载点）；
+// 本地直接运行时默认 ./data/offcuts-snapshot.json，可用 OFFCUTS_SNAPSHOT 覆盖，
+// 置空则退化为纯进程内存模式。
+const DEFAULT_SNAPSHOT = process.env.OFFCUTS_SNAPSHOT !== undefined
+  ? process.env.OFFCUTS_SNAPSHOT
+  : path.join(__dirname, 'data', 'offcuts-snapshot.json');
+
+(function restoreAtStartup() {
+  try {
+    const info = initPersistence(DEFAULT_SNAPSHOT || null);
+    if (info && info.restored) {
+      console.log(`已恢复余料库存快照：${info.offcutCount} 块余料，`
+        + `${info.allocationIds.length} 个有效预占单`);
+    }
+  } catch (err) {
+    console.error(`启动失败：${err.message}`);
+    process.exit(1);
+  }
+})();
 
 // 叠纸排程会回传多张纸的完整切割树（最多 500 张），放宽请求体上限
 app.use(express.json({ limit: '10mb' }));
@@ -133,13 +157,19 @@ app.post('/api/layout/stack/work-order/sampling', (req, res) => {
 
 /* ---------------- 余料库存与复用预占 ---------------- */
 
+// 输入校验错误返回 400；库存快照写盘 / 读取失败返回 500（库存与编号未前进）
+function sendOffcutError(res, err) {
+  const status = err instanceof SnapshotError ? 500 : 400;
+  res.status(status).json({ error: err.message || (status === 500 ? '库存服务错误' : '输入无效') });
+}
+
 // 余料录入：手工录入单条余料（纸型/纹向/刀缝/尺寸/来源批次）
 app.post('/api/offcuts', (req, res) => {
   try {
     const result = createOffcut(req.body || {});
     res.status(201).json(result);
   } catch (err) {
-    res.status(400).json({ error: err.message || '输入无效' });
+    sendOffcutError(res, err);
   }
 });
 
@@ -150,7 +180,7 @@ app.post('/api/offcuts/ingest', (req, res) => {
     const result = ingestOffcuts(req.body || {});
     res.status(201).json(result);
   } catch (err) {
-    res.status(400).json({ error: err.message || '输入无效' });
+    sendOffcutError(res, err);
   }
 });
 
@@ -172,7 +202,7 @@ app.post('/api/offcuts/allocate', (req, res) => {
     const result = allocateOffcuts(req.body || {});
     res.json(result);
   } catch (err) {
-    res.status(400).json({ error: err.message || '输入无效' });
+    sendOffcutError(res, err);
   }
 });
 
@@ -182,7 +212,7 @@ app.post('/api/offcuts/release', (req, res) => {
     const result = releaseAllocations(req.body || {});
     res.json(result);
   } catch (err) {
-    res.status(400).json({ error: err.message || '输入无效' });
+    sendOffcutError(res, err);
   }
 });
 
