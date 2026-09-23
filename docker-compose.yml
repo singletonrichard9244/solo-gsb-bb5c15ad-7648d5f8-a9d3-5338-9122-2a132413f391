@@ -8,4 +8,15 @@ services:
       - "${PORT:-3000}:3000"
     environment:
       - NODE_ENV=production
+      # 余料库存快照写入数据卷，容器重建 / 升级后自动恢复余料、预占关系与编号
+      - OFFCUTS_DATA_FILE=/data/offcuts.snapshot.json
+    volumes:
+      # 命名数据卷：docker compose down 不删除；如需彻底清空可
+      # docker compose down -v（或 docker volume rm sheet-layout_offcuts-data）
+      - offcuts-data:/data
     restart: unless-stopped
+
+volumes:
+  # 余料库存快照数据卷（实际命名为 <项目目录名>_offcuts-data，
+  # 通常是 sheet-layout_offcuts-data；可用 docker volume inspect 查看位置）
+  offcuts-data:

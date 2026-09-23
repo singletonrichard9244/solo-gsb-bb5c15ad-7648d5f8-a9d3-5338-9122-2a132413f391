@@ -382,7 +382,7 @@ if (typeof document !== 'undefined') {
 
   window.ocRefreshOffcuts = ocRefresh;
 
-  // 页面初始加载库存角标（服务重启后库存为空则不显示）
+  // 页面初始加载库存角标（库存经服务端快照持久化，重启后自动恢复）
   (async function initBadge() {
     try {
       const data = await ocApi('/api/offcuts');

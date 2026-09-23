@@ -15,10 +15,22 @@
  *    一次请求必须预占足量余料，无法满足时不改动任何记录并返回缺口明细；
  *  - 释放预占（按预占单号 / 余料编号）。
  *
- * 库存保存在进程内存中（与本项目“无外部服务或数据库”一致），
- * 重启服务后清空；提供 _resetStore() 仅供测试使用。
+ * 持久化（写前提交 / commit-before-publish）：
+ * 手工录入、结果登记、预占、释放四类写操作统一经由持久化提交——
+ * 先在状态副本（draft）中完成全部校验、去重与取号，再把目标状态
+ * 原子写入本地快照文件（临时文件 fsync 后 rename 替换），写盘成功后
+ * 才发布（publish）到进程内存库存；写盘失败抛出 SnapshotIOError，
+ * 库存状态与三个自动编号（余料 OC / 预占单 AL / 批次 BATCH）均不前进。
+ * 服务启动时 initOffcutStore(file) 从快照恢复余料、预占关系及编号；
+ * 快照文件不存在视为空库，文件存在但内容损坏（JSON 非法 / 结构与
+ * 编号不一致等）则明确抛错拒绝启动，避免把既有库存误当作空库。
+ * 恢复后同批次重复登记仍按来源指纹去重。
+ * 未调用 initOffcutStore（或显式 useEphemeralStore）时为纯内存模式，
+ * 仅供测试使用；提供 _resetStore() 仅供测试使用。
  */
 
+const fs = require('node:fs');
+const path = require('node:path');
 const {
   normalizePaperGrain,
   normalizeProductGrain,
@@ -26,19 +38,92 @@ const {
 } = require('./packer');
 
 const EPS = 1e-6;
+const SNAPSHOT_VERSION = 1;
 
 const round3 = (v) => Math.round(v * 1000) / 1000;
 
-/* ---------------- 内存存储 ---------------- */
+/* ---------------- 错误类型 ---------------- */
 
-const store = {
-  seq: 0, // 余料记录序号
-  allocSeq: 0, // 预占单号序号
-  batchSeq: 0, // 自动来源批次序号
-  offcuts: new Map(), // id → 记录
-};
+/** 快照损坏：恢复时文件存在但无法解析 / 内容不合法 → 拒绝启动 */
+class SnapshotCorruptError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'SnapshotCorruptError';
+  }
+}
 
-/** 仅供测试：清空库存与全部序号 */
+/** 快照写盘失败：原子提交未落盘 → 库存状态与编号均不发布，服务返回 503 */
+class SnapshotIOError extends Error {
+  constructor(message, cause) {
+    super(message);
+    this.name = 'SnapshotIOError';
+    this.cause = cause || null;
+  }
+}
+
+/* ---------------- 存储状态 ---------------- */
+
+/**
+ * 持久化句柄：{ kind:'file', file }（启用快照）或
+ * { kind:'memory' }（纯内存，测试用）。
+ */
+let persistence = { kind: 'memory' };
+
+const store = emptyState();
+
+function emptyState() {
+  return {
+    seq: 0, // 余料记录序号
+    allocSeq: 0, // 预占单号序号
+    batchSeq: 0, // 自动来源批次序号
+    offcuts: new Map(), // id → 记录
+  };
+}
+
+/**
+ * 启动时从快照恢复余料库存。file 不存在时按空库启动（不预先创建文件）；
+ * 文件存在但损坏 / 结构与编号不一致时抛 SnapshotCorruptError，
+ * 调用方应拒绝继续启动，避免把既有库存当作空库。
+ * @param {string} file 快照文件绝对路径
+ */
+function initOffcutStore(file) {
+  if (!file || typeof file !== 'string') {
+    throw new Error('余料快照文件路径无效');
+  }
+  persistence = { kind: 'file', file: path.resolve(file) };
+
+  let text;
+  try {
+    text = fs.readFileSync(persistence.file, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT' || err.code === 'ENOTDIR') {
+      // 快照文件不存在（ENOTDIR 表示路径某段是普通文件，同样不可能存在快照）
+      // → 按空库启动；后续写盘若路径仍不可用会返回服务错误，不会静默丢数据
+      store.seq = 0;
+      store.allocSeq = 0;
+      store.batchSeq = 0;
+      store.offcuts.clear();
+      return;
+    }
+    throw new SnapshotCorruptError(`无法读取余料快照 ${persistence.file}：${err.code || err.message}`);
+  }
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (err) {
+    throw new SnapshotCorruptError(`余料快照 ${persistence.file} 已损坏（JSON 无法解析）：${err.message}`);
+  }
+  restoreState(store, data, persistence.file);
+}
+
+/** 切换为纯内存模式（测试用） */
+function useEphemeralStore() {
+  persistence = { kind: 'memory' };
+  _resetStore();
+}
+
+/** 仅供测试：清空库存与全部序号（纯内存模式；文件模式下不删快照） */
 function _resetStore() {
   store.seq = 0;
   store.allocSeq = 0;
@@ -46,19 +131,182 @@ function _resetStore() {
   store.offcuts.clear();
 }
 
-function newOffcutId() {
-  store.seq += 1;
-  return `OC-${String(store.seq).padStart(6, '0')}`;
+/* ---------------- 快照序列化 / 校验恢复 ---------------- */
+
+function serializeState(st) {
+  return {
+    version: SNAPSHOT_VERSION,
+    savedAt: new Date().toISOString(),
+    seq: st.seq,
+    allocSeq: st.allocSeq,
+    batchSeq: st.batchSeq,
+    offcuts: [...st.offcuts.values()],
+  };
 }
 
-function newAllocationId() {
-  store.allocSeq += 1;
-  return `AL-${String(store.allocSeq).padStart(6, '0')}`;
+function failCorrupt(file, detail) {
+  throw new SnapshotCorruptError(`余料快照 ${file} 已损坏：${detail}`);
 }
 
-function newBatchId() {
-  store.batchSeq += 1;
-  return `BATCH-${String(store.batchSeq).padStart(6, '0')}`;
+function isPlainObject(v) {
+  return v != null && typeof v === 'object' && !Array.isArray(v);
+}
+
+function nonNegInt(v) {
+  return Number.isInteger(v) && v >= 0;
+}
+
+/**
+ * 严格校验快照数据并恢复到 target。任一字段非法都抛 SnapshotCorruptError，
+ * 不做静默兜底（静默丢弃记录等于把既有库存当空库）。
+ */
+function restoreState(target, data, file) {
+  if (!isPlainObject(data)) failCorrupt(file, '顶层结构不是对象');
+  if (data.version !== SNAPSHOT_VERSION) {
+    failCorrupt(file, `不支持的快照版本 ${JSON.stringify(data.version)}（支持版本 ${SNAPSHOT_VERSION}）`);
+  }
+  if (!nonNegInt(data.seq) || !nonNegInt(data.allocSeq) || !nonNegInt(data.batchSeq)) {
+    failCorrupt(file, '自动编号 seq/allocSeq/batchSeq 必须是非负整数');
+  }
+  if (!Array.isArray(data.offcuts)) failCorrupt(file, 'offcuts 必须是数组');
+  if (data.offcuts.length > 500000) failCorrupt(file, '余料记录数超出上限');
+
+  const next = emptyState();
+  const seenIds = new Set();
+  for (let i = 0; i < data.offcuts.length; i += 1) {
+    const rec = data.offcuts[i];
+    const at = `第 ${i + 1} 条余料记录`;
+    if (!isPlainObject(rec)) failCorrupt(file, `${at}不是对象`);
+    if (typeof rec.id !== 'string' || !/^OC-\d{6,}$/.test(rec.id)) {
+      failCorrupt(file, `${at}编号非法：${JSON.stringify(rec.id)}`);
+    }
+    if (seenIds.has(rec.id)) failCorrupt(file, `余料编号重复：${rec.id}`);
+    seenIds.add(rec.id);
+    const idNum = Number(rec.id.slice(3));
+    if (idNum > data.seq) failCorrupt(file, `余料 ${rec.id} 超出当前序号 ${data.seq}`);
+
+    if (!isPlainObject(rec.source)) failCorrupt(file, `${at}缺少 source 来源信息`);
+    if (!['single', 'batch', 'cost', 'manual'].includes(rec.source.type)) {
+      failCorrupt(file, `${at}来源类型非法：${JSON.stringify(rec.source.type)}`);
+    }
+    const numFields = ['paperWidth', 'paperHeight', 'kerf', 'x', 'y', 'w', 'h', 'area'];
+    for (const f of numFields) {
+      if (typeof rec[f] !== 'number' || !Number.isFinite(rec[f]) || rec[f] < 0) {
+        failCorrupt(file, `${at}字段 ${f} 必须是非负数字`);
+      }
+    }
+    if (rec.w <= 0 || rec.h <= 0 || rec.paperWidth <= 0 || rec.paperHeight <= 0) {
+      failCorrupt(file, `${at}尺寸 / 纸型宽高必须为正数`);
+    }
+    if (!['along-width', 'along-height'].includes(rec.paperGrain)) {
+      failCorrupt(file, `${at}纸张纹向非法：${JSON.stringify(rec.paperGrain)}`);
+    }
+    if (!['available', 'reserved'].includes(rec.status)) {
+      failCorrupt(file, `${at}状态非法：${JSON.stringify(rec.status)}`);
+    }
+    if (rec.status === 'reserved') {
+      const rv = rec.reservation;
+      if (!isPlainObject(rv)) failCorrupt(file, `余料 ${rec.id} 已预占但缺少预占关系 reservation`);
+      if (typeof rv.allocationId !== 'string' || !/^AL-\d{6,}$/.test(rv.allocationId)) {
+        failCorrupt(file, `余料 ${rec.id} 的预占单号非法：${JSON.stringify(rv && rv.allocationId)}`);
+      }
+      const alNum = Number(rv.allocationId.slice(3));
+      if (alNum > data.allocSeq) {
+        failCorrupt(file, `预占单 ${rv.allocationId} 超出当前序号 ${data.allocSeq}`);
+      }
+      if (!isPlainObject(rv.product)) failCorrupt(file, `余料 ${rec.id} 的预占成品信息缺失`);
+    } else if (rec.reservation != null) {
+      failCorrupt(file, `余料 ${rec.id} 状态为可用却带有预占关系`);
+    }
+    next.offcuts.set(rec.id, rec);
+  }
+
+  // 编号必须能覆盖现存记录（小序号记录可能已随预占关系一起保留，故只校验不越界、不强制连续）
+  if (data.seq < next.offcuts.size) {
+    failCorrupt(file, `余料序号 ${data.seq} 小于现存记录数 ${next.offcuts.size}`);
+  }
+
+  next.seq = data.seq;
+  next.allocSeq = data.allocSeq;
+  next.batchSeq = data.batchSeq;
+  target.seq = next.seq;
+  target.allocSeq = next.allocSeq;
+  target.batchSeq = next.batchSeq;
+  target.offcuts = next.offcuts;
+}
+
+/**
+ * 原子写快照：同目录临时文件写入并 fsync 后 rename 替换正式文件，
+ * 保证快照要么是上一版、要么是新版，不会出现半截文件。
+ */
+function writeSnapshot(st) {
+  if (persistence.kind !== 'file') return; // 纯内存模式（测试）
+  const file = persistence.file;
+  const dir = path.dirname(file);
+  const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.${Date.now()}.tmp`);
+  let fd = null;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fd = fs.openSync(tmp, 'w');
+    fs.writeFileSync(fd, JSON.stringify(serializeState(st)), 'utf8');
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    if (fd != null) {
+      try { fs.closeSync(fd); } catch (_) { /* 忽略清理错误 */ }
+    }
+    try { fs.unlinkSync(tmp); } catch (_) { /* 临时文件可能未生成 */ }
+    throw new SnapshotIOError(`余料快照写盘失败（本次操作未生效）：${err.code || err.message}`, err);
+  }
+}
+
+/**
+ * 统一持久化提交：在 draft（当前状态的深拷贝）上执行 mutate，
+ * mutate 内完成全部校验 / 去重 / 取号并返回结果；成功落盘后才把
+ * draft 发布为活动库存。校验错误（mutate 抛错）或写盘失败时，
+ * 活动状态与编号均不变。
+ */
+function commit(mutate) {
+  const draft = cloneState(store);
+  const result = mutate(draft);
+  writeSnapshot(draft);
+  publishState(draft);
+  return result;
+}
+
+function cloneState(st) {
+  return {
+    seq: st.seq,
+    allocSeq: st.allocSeq,
+    batchSeq: st.batchSeq,
+    offcuts: new Map(
+      JSON.parse(JSON.stringify([...st.offcuts.values()])).map((rec) => [rec.id, rec])
+    ),
+  };
+}
+
+function publishState(st) {
+  store.seq = st.seq;
+  store.allocSeq = st.allocSeq;
+  store.batchSeq = st.batchSeq;
+  store.offcuts = st.offcuts;
+}
+
+function newOffcutIdOn(st) {
+  st.seq += 1;
+  return `OC-${String(st.seq).padStart(6, '0')}`;
+}
+
+function newAllocationIdOn(st) {
+  st.allocSeq += 1;
+  return `AL-${String(st.allocSeq).padStart(6, '0')}`;
+}
+
+function newBatchIdOn(st) {
+  st.batchSeq += 1;
+  return `BATCH-${String(st.batchSeq).padStart(6, '0')}`;
 }
 
 /* ---------------- 输入校验 ---------------- */
@@ -99,10 +347,6 @@ function explicitBatchId(value) {
   return s;
 }
 
-function normalizeBatchId(value) {
-  return explicitBatchId(value) || newBatchId();
-}
-
 /** 规范化单条余料的纸型 / 几何字段（手工录入与结果登记共用） */
 function normalizeOffcutShape(raw, pos) {
   const who = pos ? `第 ${pos} 条余料的` : '';
@@ -135,7 +379,7 @@ function normalizeFreeRect(free, paper) {
 
 /**
  * 由已校验的自由矩形构造余料记录。
- * id 留空（null），由调用方在确定入库时通过 newOffcutId() 赋值，
+ * id 留空（null），由调用方在确定入库时通过 newOffcutIdOn() 赋值，
  * 保证跳过的重复项与校验失败的批次不消耗余料序号。
  * @param {object} rect { x, y, w, h }（normalizeFreeRect 返回）
  * @param {object} paper { width, height, kerf, grain }
@@ -169,18 +413,6 @@ function buildRecord(rect, paper, meta) {
   };
 }
 
-/**
- * 把一个自由矩形标准化为余料记录（校验 + 取号，供确定入库的路径使用）。
- * @param {object} free { x, y, w, h }（layout.frees 元素）
- * @param {object} paper { width, height, kerf, grain }（layout.paper）
- * @param {object} meta { type, batchId, sheetIndex, round, paperId, paperName, orderNo }
- */
-function buildRecordFromFree(free, paper, meta) {
-  const rec = buildRecord(normalizeFreeRect(free, paper), paper, meta);
-  rec.id = newOffcutId();
-  return rec;
-}
-
 /* ---------------- 从排料结果登记 ---------------- */
 
 /** 规范化排料结果中的纸张信息（单张 / 批量 / 成本 / 比选登记共用） */
@@ -196,11 +428,11 @@ function normalizeLayoutPaper(layoutResult) {
   };
 }
 
-/** 从单张 layout() 结果提取余料记录 */
+/** 从单张 layout() 结果提取余料记录（纯函数：校验 + 构造，不取号、不写库） */
 function offcutsFromLayout(layoutResult, meta) {
   const paper = normalizeLayoutPaper(layoutResult);
   const frees = Array.isArray(layoutResult.frees) ? layoutResult.frees : [];
-  return frees.map((free) => buildRecordFromFree(free, paper, meta));
+  return frees.map((free) => buildRecord(normalizeFreeRect(free, paper), paper, meta));
 }
 
 /**
@@ -224,10 +456,11 @@ function detectResultShape(raw) {
  * 也可直接把单张 / 批量 / 成本 / 比选返回作为请求体。
  * 同一来源批次（batchId）下纸型、刀缝、坐标、尺寸完全相同的余料不重复登记。
  *
- * 原子性：先校验全部待登记余料（任一无效即整体报错），再按来源指纹
- * 处理库内与本次请求内的重复项，最后一次性取号写入；任一余料无效时
- * 库存、预占状态与自动生成的余料/批次序号均不变，修正后重试不会出现
- * 跳过记录或编号错位。
+ * 原子性（校验 + 编号 + 落仓 + 持久化一体）：先在状态副本中校验全部待登记
+ * 余料（任一无效即整体报错，活动库存与编号不动），再按来源指纹处理库内与
+ * 本次请求内的重复项，一次性取号写入副本；副本原子落盘成功后才发布。
+ * 写盘失败时库存、预占状态与自动生成的余料/批次序号均不变，修正后重试
+ * 不会出现跳过记录或编号错位。
  *
  * @returns {{ batchId, ingested:number, skipped:number, offcutIds:string[] }}
  */
@@ -281,60 +514,63 @@ function ingestOffcuts(input) {
     });
   }
 
-  // 第一阶段：校验全部纸张与待登记余料（纯校验，不取号、不写库）
-  const pending = []; // [{ rect, paper, meta }]
-  for (const plan of plans) {
-    const paper = normalizeLayoutPaper(plan.layout);
-    const frees = Array.isArray(plan.layout.frees) ? plan.layout.frees : [];
-    for (const free of frees) {
-      pending.push({ rect: normalizeFreeRect(free, paper), paper, meta: plan.meta });
+  return commit((st) => {
+    // 第一阶段：校验全部纸张与待登记余料（纯校验，不取号、不写库）
+    const pending = []; // [{ rect, paper, meta }]
+    for (const plan of plans) {
+      const paper = normalizeLayoutPaper(plan.layout);
+      const frees = Array.isArray(plan.layout.frees) ? plan.layout.frees : [];
+      for (const free of frees) {
+        pending.push({ rect: normalizeFreeRect(free, paper), paper, meta: plan.meta });
+      }
     }
-  }
 
-  // 全部校验通过后才确定来源批次号（缺省时此刻才消耗自动批次序号）
-  const batchId = givenBatchId || newBatchId();
+    // 全部校验通过后才确定来源批次号（缺省时此刻才消耗自动批次序号）
+    const batchId = givenBatchId || newBatchIdOn(st);
 
-  // 第二阶段：同一来源（批次 + 纸张序号）下纸型、刀缝、坐标、尺寸完全相同的
-  // 余料不重复登记；跨请求对同一 batchId 重复提交同样去重（保持原有登记顺序）
-  const fingerprints = new Set();
-  for (const rec of store.offcuts.values()) fingerprints.add(fingerprintOf(rec));
+    // 第二阶段：同一来源（批次 + 纸张序号）下纸型、刀缝、坐标、尺寸完全相同的
+    // 余料不重复登记；跨请求（含重启恢复后）对同一 batchId 重复提交同样去重
+    const fingerprints = new Set();
+    for (const rec of st.offcuts.values()) fingerprints.add(fingerprintOf(rec));
 
-  const seen = new Set(); // 本次请求内的指纹（与库内指纹一并判重）
-  const accepted = [];
-  let skipped = 0;
-  for (const item of pending) {
-    const rec = buildRecord(item.rect, item.paper, { ...item.meta, batchId });
-    const fp = fingerprintOf(rec);
-    if (seen.has(fp) || fingerprints.has(fp)) {
-      skipped += 1;
-      continue;
+    const seen = new Set(); // 本次请求内的指纹（与库内指纹一并判重）
+    const accepted = [];
+    let skipped = 0;
+    for (const item of pending) {
+      const rec = buildRecord(item.rect, item.paper, { ...item.meta, batchId });
+      const fp = fingerprintOf(rec);
+      if (seen.has(fp) || fingerprints.has(fp)) {
+        skipped += 1;
+        continue;
+      }
+      seen.add(fp);
+      accepted.push(rec);
     }
-    seen.add(fp);
-    accepted.push(rec);
-  }
 
-  // 第三阶段：一次性取号写入（只有确定入库的记录才消耗余料序号）
-  const ingested = [];
-  for (const rec of accepted) {
-    rec.id = newOffcutId();
-    store.offcuts.set(rec.id, rec);
-    ingested.push(rec);
-  }
+    // 第三阶段：一次性取号写入副本（只有确定入库的记录才消耗余料序号）
+    const ingested = [];
+    for (const rec of accepted) {
+      rec.id = newOffcutIdOn(st);
+      st.offcuts.set(rec.id, rec);
+      ingested.push(rec);
+    }
 
-  return {
-    batchId,
-    shape,
-    ingested: ingested.length,
-    skipped,
-    offcutIds: ingested.map((r) => r.id),
-    summary: inventorySummary(),
-  };
+    return {
+      batchId,
+      shape,
+      ingested: ingested.length,
+      skipped,
+      offcutIds: ingested.map((r) => r.id),
+      summary: inventorySummaryOn(st),
+    };
+  });
 }
 
 /* ---------------- 手工录入 ---------------- */
 
 /**
  * 手工录入一条余料（切下后留存的矩形，无原纸面坐标时坐标取 0,0）。
+ * 校验 / 取号在状态副本内完成，快照原子落盘成功后才发布。
  * @param {object} input { paperName?, width, height, paperGrain?|grain?, kerf?, batchId?, orderNo?, note? }
  */
 function createOffcut(input) {
@@ -342,32 +578,42 @@ function createOffcut(input) {
   const shape = normalizeOffcutShape(input);
   const paperName = input.paperName != null ? String(input.paperName).trim() : '';
   const orderNo = normalizeRef(input.orderNo, '订单号');
-  const free = { x: 0, y: 0, w: shape.width, h: shape.height };
-  const rec = buildRecordFromFree(free, {
-    width: shape.width,
-    height: shape.height,
-    kerf: shape.kerf,
-    grain: shape.paperGrain,
-  }, {
-    type: 'manual',
-    batchId: normalizeBatchId(input.batchId),
-    sheetIndex: null,
-    paperName: paperName || null,
-    orderNo,
+  const givenBatchId = explicitBatchId(input.batchId);
+  const note = input.note != null && input.note !== '' ? String(input.note).slice(0, 256) : null;
+
+  return commit((st) => {
+    const free = { x: 0, y: 0, w: shape.width, h: shape.height };
+    const rec = buildRecord(free, {
+      width: shape.width,
+      height: shape.height,
+      kerf: shape.kerf,
+      grain: shape.paperGrain,
+    }, {
+      type: 'manual',
+      batchId: givenBatchId || newBatchIdOn(st),
+      sheetIndex: null,
+      paperName: paperName || null,
+      orderNo,
+    });
+    if (note) rec.source.note = note;
+    rec.id = newOffcutIdOn(st);
+    st.offcuts.set(rec.id, rec);
+    return { offcut: rec, summary: inventorySummaryOn(st) };
   });
-  if (input.note != null && input.note !== '') rec.source.note = String(input.note).slice(0, 256);
-  store.offcuts.set(rec.id, rec);
-  return { offcut: rec, summary: inventorySummary() };
 }
 
 /* ---------------- 查询 ---------------- */
 
 function inventorySummary() {
+  return inventorySummaryOn(store);
+}
+
+function inventorySummaryOn(st) {
   let available = 0;
   let reserved = 0;
   let availableArea = 0;
   let reservedArea = 0;
-  for (const rec of store.offcuts.values()) {
+  for (const rec of st.offcuts.values()) {
     if (rec.status === 'reserved') {
       reserved += 1;
       reservedArea += rec.area;
@@ -377,7 +623,7 @@ function inventorySummary() {
     }
   }
   return {
-    total: store.offcuts.size,
+    total: st.offcuts.size,
     available,
     reserved,
     availableArea: round3(availableArea),
@@ -491,7 +737,9 @@ function feasiblePlacement(rec, pw, ph, grain) {
  *  1. 仅在“可用”余料中按旋转 / 纹向可行性收集候选；
  *  2. 候选决胜（全部确定性）：占用后剩余面积 ↑小 → 余料面积 ↑小 →
  *     余料短边 ↑小 → 余料长边 ↑小 → 不旋转优先 → 余料编号 ↑小（录入先后）；
- *  3. 可满足（候选数 ≥ 数量）才一次性预占；否则不改动任何记录，返回缺口明细。
+ *  3. 可满足（候选数 ≥ 数量）才在状态副本内一次性预占并取预占单号，
+ *     副本原子落盘成功后才发布；无法满足时不改动任何记录（不进入提交），
+ *     返回缺口明细。
  *
  * @param {object} input { width, height, quantity, grain?, ref? }
  */
@@ -522,7 +770,7 @@ function allocateOffcuts(input) {
     width: round3(width), height: round3(height), quantity, grain, ref,
   };
 
-  // 无法满足：原子失败——不预占任何余料，返回缺口明细
+  // 无法满足：原子失败——不预占任何余料、不取预占单号、不触发落盘，返回缺口明细
   if (candidates.length < quantity) {
     candidates.sort(compareCandidates);
     return {
@@ -548,49 +796,52 @@ function allocateOffcuts(input) {
     };
   }
 
-  // 确定性择优排序后取前 quantity 条，一次性提交（先算后改，保证原子语义）
+  // 确定性择优排序后取前 quantity 条，在副本中一次性提交（先算后改，保证原子语义）
   candidates.sort(compareCandidates);
   const chosen = candidates.slice(0, quantity);
-  const allocationId = newAllocationId();
-  const now = new Date().toISOString();
-  const reserved = chosen.map((c) => {
-    const rec = c.rec;
-    rec.status = 'reserved';
-    rec.reservation = {
-      allocationId,
-      product: { width: round3(width), height: round3(height), grain },
-      rotated: c.rotated,
-      placedW: c.placedW,
-      placedH: c.placedH,
-      ref,
-      createdAt: now,
-    };
+
+  return commit((st) => {
+    const allocationId = newAllocationIdOn(st);
+    const now = new Date().toISOString();
+    const reserved = chosen.map((c) => {
+      const rec = st.offcuts.get(c.rec.id);
+      rec.status = 'reserved';
+      rec.reservation = {
+        allocationId,
+        product: { width: round3(width), height: round3(height), grain },
+        rotated: c.rotated,
+        placedW: c.placedW,
+        placedH: c.placedH,
+        ref,
+        createdAt: now,
+      };
+      return {
+        offcutId: rec.id,
+        paperName: rec.paperName,
+        width: rec.w,
+        height: rec.h,
+        paperGrain: rec.paperGrain,
+        area: rec.area,
+        rotated: c.rotated,
+        placedW: c.placedW,
+        placedH: c.placedH,
+        residualArea: c.residualArea,
+        source: rec.source,
+      };
+    });
+
     return {
-      offcutId: rec.id,
-      paperName: rec.paperName,
-      width: rec.w,
-      height: rec.h,
-      paperGrain: rec.paperGrain,
-      area: rec.area,
-      rotated: c.rotated,
-      placedW: c.placedW,
-      placedH: c.placedH,
-      residualArea: c.residualArea,
-      source: rec.source,
+      status: 'fulfilled',
+      allocated: true,
+      allocationId,
+      request,
+      summary: inventorySummaryOn(st),
+      feasibleCount: candidates.length,
+      reservedCount: reserved.length,
+      shortfall: 0,
+      reserved,
     };
   });
-
-  return {
-    status: 'fulfilled',
-    allocated: true,
-    allocationId,
-    request,
-    summary: inventorySummary(),
-    feasibleCount: candidates.length,
-    reservedCount: reserved.length,
-    shortfall: 0,
-    reserved,
-  };
 }
 
 /** 候选决胜：剩余面积小 → 余料面积小 → 短边小 → 长边小 → 不旋转 → 录入先后 */
@@ -614,8 +865,8 @@ function compareCandidates(a, b) {
 
 /**
  * 释放预占：可按预占单号 allocationIds 或余料编号 offcutIds 释放。
- * 编号不存在或对应余料未预占均返回 HTTP 400（调用方负责，本函数抛错），
- * 全部校验通过后才一次性释放。
+ * 编号不存在或对应余料未预占均抛错（调用方返回 HTTP 400），全部校验
+ * 在状态副本中通过后才一次性释放，副本原子落盘成功后才发布。
  * @returns {{ releasedCount, allocationIds, offcutIds, reservations:[...], summary }}
  */
 function releaseAllocations(input) {
@@ -626,38 +877,40 @@ function releaseAllocations(input) {
     throw new Error('需提供要释放的预占单号（allocationIds）或余料编号（offcutIds）');
   }
 
-  const targets = new Map(); // id(offcut) → rec，去重
-  for (const aid of allocationIds) {
-    const hits = [...store.offcuts.values()].filter((r) => r.reservation
-      && r.reservation.allocationId === aid);
-    if (hits.length === 0) throw new Error(`预占单号不存在或已释放：${aid}`);
-    for (const rec of hits) targets.set(rec.id, rec);
-  }
-  for (const oid of offcutIds) {
-    const rec = store.offcuts.get(oid);
-    if (!rec) throw new Error(`余料编号不存在：${oid}`);
-    if (rec.status !== 'reserved') throw new Error(`余料 ${oid} 当前未处于预占状态，无需释放`);
-    targets.set(rec.id, rec);
-  }
+  return commit((st) => {
+    const targets = new Map(); // id(offcut) → 记录（副本内），去重
+    for (const aid of allocationIds) {
+      const hits = [...st.offcuts.values()].filter((r) => r.reservation
+        && r.reservation.allocationId === aid);
+      if (hits.length === 0) throw new Error(`预占单号不存在或已释放：${aid}`);
+      for (const rec of hits) targets.set(rec.id, rec);
+    }
+    for (const oid of offcutIds) {
+      const rec = st.offcuts.get(oid);
+      if (!rec) throw new Error(`余料编号不存在：${oid}`);
+      if (rec.status !== 'reserved') throw new Error(`余料 ${oid} 当前未处于预占状态，无需释放`);
+      targets.set(rec.id, rec);
+    }
 
-  // 校验全部通过后原子释放
-  const touchedAllocations = new Set();
-  const reservations = [];
-  for (const rec of targets.values()) {
-    touchedAllocations.add(rec.reservation.allocationId);
-    reservations.push({ offcutId: rec.id, allocationId: rec.reservation.allocationId });
-    rec.status = 'available';
-    rec.reservation = null;
-  }
-  reservations.sort((a, b) => offcutSeq(a.offcutId) - offcutSeq(b.offcutId));
+    // 校验全部通过后原子释放
+    const touchedAllocations = new Set();
+    const reservations = [];
+    for (const rec of targets.values()) {
+      touchedAllocations.add(rec.reservation.allocationId);
+      reservations.push({ offcutId: rec.id, allocationId: rec.reservation.allocationId });
+      rec.status = 'available';
+      rec.reservation = null;
+    }
+    reservations.sort((a, b) => offcutSeq(a.offcutId) - offcutSeq(b.offcutId));
 
-  return {
-    releasedCount: targets.size,
-    allocationIds: [...touchedAllocations].sort(),
-    offcutIds: reservations.map((r) => r.offcutId),
-    reservations,
-    summary: inventorySummary(),
-  };
+    return {
+      releasedCount: targets.size,
+      allocationIds: [...touchedAllocations].sort(),
+      offcutIds: reservations.map((r) => r.offcutId),
+      reservations,
+      summary: inventorySummaryOn(st),
+    };
+  });
 }
 
 function normalizeIdList(value, field) {
@@ -673,6 +926,10 @@ function normalizeIdList(value, field) {
 
 module.exports = {
   _resetStore,
+  initOffcutStore,
+  useEphemeralStore,
+  SnapshotIOError,
+  SnapshotCorruptError,
   inventorySummary,
   offcutsFromLayout,
   ingestOffcuts,

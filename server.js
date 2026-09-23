@@ -9,12 +9,26 @@ const { workOrder, workOrderCsv } = require('./src/workorder');
 const { workOrderProgress } = require('./src/progress');
 const { samplingPlan } = require('./src/sampling');
 const {
+  initOffcutStore,
+  SnapshotIOError,
   ingestOffcuts,
   createOffcut,
   listOffcuts,
   allocateOffcuts,
   releaseAllocations,
 } = require('./src/offcuts');
+
+// 启动时先从本地快照恢复余料、预占关系与自动编号；快照损坏则拒绝启动，
+// 避免把既有库存误当作空库。快照路径可用 OFFCUTS_DATA_FILE 覆盖。
+const offcutDataFile = process.env.OFFCUTS_DATA_FILE
+  || path.join(__dirname, 'data', 'offcuts.snapshot.json');
+try {
+  initOffcutStore(offcutDataFile);
+} catch (err) {
+  console.error(`服务启动失败：${err.message}`);
+  console.error('请修复或移走损坏的余料快照文件后再启动（移走将以空库启动）。');
+  process.exit(1);
+}
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -133,13 +147,23 @@ app.post('/api/layout/stack/work-order/sampling', (req, res) => {
 
 /* ---------------- 余料库存与复用预占 ---------------- */
 
+// 写操作的统一错误映射：输入校验失败 400；快照写盘失败 503（服务错误，
+// 库存与编号均未前进），客户端可原样重试
+function offcutWriteError(res, err) {
+  if (err instanceof SnapshotIOError) {
+    res.status(503).json({ error: err.message || '余料快照写盘失败，请稍后重试' });
+    return;
+  }
+  res.status(400).json({ error: err.message || '输入无效' });
+}
+
 // 余料录入：手工录入单条余料（纸型/纹向/刀缝/尺寸/来源批次）
 app.post('/api/offcuts', (req, res) => {
   try {
     const result = createOffcut(req.body || {});
     res.status(201).json(result);
   } catch (err) {
-    res.status(400).json({ error: err.message || '输入无效' });
+    offcutWriteError(res, err);
   }
 });
 
@@ -150,7 +174,7 @@ app.post('/api/offcuts/ingest', (req, res) => {
     const result = ingestOffcuts(req.body || {});
     res.status(201).json(result);
   } catch (err) {
-    res.status(400).json({ error: err.message || '输入无效' });
+    offcutWriteError(res, err);
   }
 });
 
@@ -172,7 +196,7 @@ app.post('/api/offcuts/allocate', (req, res) => {
     const result = allocateOffcuts(req.body || {});
     res.json(result);
   } catch (err) {
-    res.status(400).json({ error: err.message || '输入无效' });
+    offcutWriteError(res, err);
   }
 });
 
@@ -182,12 +206,13 @@ app.post('/api/offcuts/release', (req, res) => {
     const result = releaseAllocations(req.body || {});
     res.json(result);
   } catch (err) {
-    res.status(400).json({ error: err.message || '输入无效' });
+    offcutWriteError(res, err);
   }
 });
 
 app.listen(PORT, () => {
   console.log(`单张纸裁切试排服务已启动: http://localhost:${PORT}`);
+  console.log(`余料库存快照: ${offcutDataFile}`);
 });
 
 module.exports = app;
